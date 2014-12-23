@@ -23,10 +23,30 @@ def resolve_profile_tracks_url(friendly_url):
         resolved_profile_uri = json.loads(r.text)['location']
         return resolved_profile_uri
 
+def get_profile_info(friendly_url):
+    r = requests.get(
+        'http://api.soundcloud.com/resolve.json?url=http://soundcloud.com/{}/&client_id={}'.format(friendly_url, CLIENTID), allow_redirects=False)
 
-def get_profile_tracks(tracks_url):
-    r = requests.get(tracks_url)
-    return json.loads(r.text)
+    if 'errors' in json.loads(r.text):
+        print "{}\nCannot find the specified user.".format(json.loads(r.text)['errors'][0]['error_message'])
+        sys.exit(1)
+    else:
+        userurl = json.loads(r.text)['location']
+        s = requests.get(userurl, allow_redirects=False)
+
+        if 'errors' in json.loads(s.text):
+            sys.exit(1)
+        else:
+            return json.loads(s.text)
+
+def get_profile_tracks(tracks_url, tracks_num):
+    tracks = []
+    for pagenum in range(0,int(tracks_num/200) + 1):
+        r = requests.get(tracks_url + "&limit=200&offset={}".format(str(200*pagenum)))
+	pagetracks = json.loads(r.text)
+        for track in pagetracks:
+            tracks.append(track)
+    return tracks
 
 
 def get_download_link(waveform_url):
@@ -93,7 +113,8 @@ def main(args):
         os.makedirs(directory)
 
     tracks_url = resolve_profile_tracks_url(username)
-    track_listing = get_profile_tracks(tracks_url)
+    tracks_num = int(get_profile_info(username)['track_count'])
+    track_listing = get_profile_tracks(tracks_url, tracks_num)
 
     track_amount = [1, len(track_listing)]
 
