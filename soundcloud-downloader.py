@@ -1,34 +1,40 @@
+#!/usr/bin/env python3
+
+from progressbar import AdaptiveTransferSpeed, ProgressBar, Bar, Percentage, DataSize, SimpleProgress
+from progressbar.widgets import WidgetBase
 import string
 import requests
 import json
 import argparse
 import sys
-import urllib2
+import urllib
 import mutagen
+import mutagen.mp3
 import os
+import re
 import platform
 from mutagen.easyid3 import EasyID3
 
-CLIENTID = '2412b70da476791567d496f0f3c26b88'
+CLIENTID = '02gUJC0hH2ct1EGOcYXQIzRFU91c72Ea'
+SKIPREGEX = re.compile('[[{(]clip|[[{(]preview|[[({]forthcoming', re.IGNORECASE)
+MINLENGTH = 121  # seconds
 
 
 def resolve_profile_tracks_url(friendly_url):
-    r = requests.get(
-        'http://api.soundcloud.com/resolve.json?url=http://soundcloud.com/{}/tracks&client_id={}'.format(friendly_url, CLIENTID), allow_redirects=False)
+    r = requests.get('http://api.soundcloud.com/resolve.json?url=http://soundcloud.com/{}/tracks&client_id={}'.format(friendly_url, CLIENTID), allow_redirects=False)
 
     if 'errors' in json.loads(r.text):
-        print "{}\nCannot find the specified user.".format(json.loads(r.text)['errors'][0]['error_message'])
+        print('Cannot find the specified user: {}'.format(json.loads(r.text)['errors'][0]['error_message']))
         sys.exit(1)
     else:
         resolved_profile_uri = json.loads(r.text)['location']
         return resolved_profile_uri
 
 def get_profile_info(friendly_url):
-    r = requests.get(
-        'http://api.soundcloud.com/resolve.json?url=http://soundcloud.com/{}/&client_id={}'.format(friendly_url, CLIENTID), allow_redirects=False)
+    r = requests.get('http://api.soundcloud.com/resolve.json?url=http://soundcloud.com/{}/&client_id={}'.format(friendly_url, CLIENTID), allow_redirects=False)
 
     if 'errors' in json.loads(r.text):
-        print "{}\nCannot find the specified user.".format(json.loads(r.text)['errors'][0]['error_message'])
+        print('Cannot find the specified user: {}'.format(json.loads(r.text)['errors'][0]['error_message']))
         sys.exit(1)
     else:
         userurl = json.loads(r.text)['location']
@@ -39,110 +45,148 @@ def get_profile_info(friendly_url):
         else:
             return json.loads(s.text)
 
-def get_profile_tracks(tracks_url, tracks_num):
+
+def get_profile_tracks_pbar(tracks_url, tracks_num):
     tracks = []
-    for pagenum in range(0,int(tracks_num/200) + 1):
-        r = requests.get(tracks_url + "&limit=200&offset={}".format(str(200*pagenum)))
-	pagetracks = json.loads(r.text)
-        for track in pagetracks:
-            tracks.append(track)
+    npages = int(tracks_num / 200) + 1
+    pbar = ProgressBar(widgets=['Fetching page ', SimpleProgress()])
+    for pagenum in pbar(range(0, npages)):
+        r = requests.get(
+            tracks_url + '&limit=200&offset={}'.format(200 * pagenum))
+        pagetracks = json.loads(r.text)
+        tracks.extend(pagetracks)
     return tracks
 
+def get_profile_tracks(tracks_url):
+    r = requests.get(tracks_url + '&limit=200')
+    pagetracks = json.loads(r.text)
+    return pagetracks
 
-def get_download_link(waveform_url):
-    unique_id = waveform_url[21:][:-6]
-    return 'http://media.soundcloud.com/stream/{}'.format(unique_id)
+def sanitize_name(name):
+    # First, strip non-printable characters
+    name = ''.join(s for s in name if s in string.printable)
+
+    # Now replace illegal filename characters
+    prohibited_chars = ['<', '>', '"', '|', ':', '*', '?', '\\', '/']
+    subst_char = '_'
+    for char in prohibited_chars:
+        name = name.replace(char, subst_char)
+
+    return name
 
 
-def download_file(download_url, artist_name, artist_friendlyname,
-                  song_name, song_genre):
-    directory = os.path.join('soundcloud-downloads', artist_friendlyname)
-    if not os.path.exists(directory):
-        os.makedirs(directory)
+class fillHalf(WidgetBase):
+    'Custom widget for progressbar to make text span half of the console'
 
-    file_name = "soundcloud-downloads/{}/{}.mp3".format(artist_friendlyname,
-                                                        song_name)
-    # urllib2 file download implementation by PabloG @ StackOverflow -
-    # http://stackoverflow.com/a/22776
-    u = urllib2.urlopen(download_url)
-    f = open(file_name, 'wb')
-    meta = u.info()
-    file_size = int(meta.getheaders("Content-Length")[0])
-    print "Downloading: {} (Bytes: {})".format(song_name, file_size)
+    def __init__(self, text, **kwargs):
+        self.text = text
 
-    file_size_dl = 0
-    block_sz = 8192
-    while True:
-        buffer = u.read(block_sz)
-        if not buffer:
-            break
+    def __call__(self, progress, data):
+        width = str(int(progress.term_width * 0.4))
+        formatstr = '{0:<' + width + '.' + width + '}'
+        return formatstr.format(self.text)
 
-        file_size_dl += len(buffer)
-        f.write(buffer)
-        status = r"%10d  [%3.2f%%]" % (
-            file_size_dl, file_size_dl * 100. / file_size)
-        status = status + chr(8) * (len(status) + 1)
-        print status,
 
-    f.close()
+def download_tracks(tracks, directory):
+    dltracks = []
+    dups = 0
+    previews = 0
+    # No ETA, progressbar.ETA() is unstable
+    DLwidgets = [DataSize(), '  ', AdaptiveTransferSpeed(), ' ', Bar(), Percentage()]
+    for track in tracks:
+        name = sanitize_name(track['title'])
+        filename = name + '.mp3'
+        filename = os.path.join(directory, filename)
+        if os.path.isfile(filename):
+            dups += 1
+        elif SKIPREGEX.search(track['title']) or track['duration'] <= MINLENGTH*1000:
+            previews += 1
+        else:
+            track['dispname'] = name
+            track['filename'] = filename
+            dltracks.append(track)
 
-    try:
-        meta = EasyID3(file_name)
-    except mutagen.id3.ID3NoHeaderError:
-        meta = mutagen.File(file_name, easy=True)
-        meta.add_tags()
+    num = len(dltracks)
+    reportstr = '{} tracks already downloaded, {} previews skipped, {} tracks to download.'
+    print(reportstr.format(dups, previews, num))
 
-    meta['title'] = song_name
-    meta['artist'] = artist_name
-    meta['genre'] = song_genre
-    meta.save()
+    for i, track in enumerate(dltracks):
+
+        tempfile_name = track['filename'] + '.part'
+
+        dispstr = '({} / {}) {}'.format(i + 1, num, track['dispname'])
+
+        download_url = track['stream_url'] + '?client_id={}'.format(CLIENTID)
+        try:
+            u = requests.get(download_url, stream=True)
+        except urllib.error.URLError as e:
+            # Print error and keep going
+            print('Error downloading {}: {} {}'.format(track['dispname'], e.code, e.reason))
+            print('URL was ' + download_url)
+
+        f = open(tempfile_name, 'wb')
+        file_size = int(u.headers.get('Content-Length'))
+
+        dlbar = ProgressBar(max_value=file_size, widgets=[fillHalf(dispstr), ' ', *DLwidgets]).start()
+        file_size_dl = 0
+        block_sz = 8192
+
+        for buf in u.iter_content(block_sz):
+            if buf:
+                f.write(buf)
+                file_size_dl += len(buf)
+                dlbar.update(file_size_dl)
+        dlbar.finish()
+        sys.stdout.flush()
+        f.close()
+
+        try:
+            meta = EasyID3(tempfile_name)
+        except mutagen.id3.ID3NoHeaderError:
+            meta = mutagen.mp3.EasyMP3(tempfile_name)
+            meta.add_tags()
+
+        meta['title'] = track['title']
+        meta['artist'] = track['user']['username']
+        meta['genre'] = track['genre']
+        meta.save()
+
+        os.rename(tempfile_name, track['filename'])
 
 
 def main(args):
-    print "SoundCloud Page Downloader\nBy J. Merriman -"
-    "http://chainsawpolice.github.io/"
+    print('SoundCloud Page Downloader By J. Merriman and C. Johnson\n'
+          'http://chainsawpolice.github.io/ http://calebj.io/\n')
 
     if not args.u:
-        print '\nPlease enter The user\'s SoundCloud permalink (a.k.a The link to their profile, without the "http://soundcloud.com" at the start).\ne.g. chainsawpolice, diplo, skrillex, etc.\n'
-        username = raw_input('> ')
+        print('\nPlease enter The user\'s SoundCloud permalink\n'
+              '(a.k.a The link to their profile, without the "http://soundcloud.com" at the start).\n'
+              'e.g. chainsawpolice, diplo, skrillex, etc.\n')
+        username = input('> ')
     else:
         username = args.u
 
-    directory = os.path.join('soundcloud-downloads')
+    tracks_url = resolve_profile_tracks_url(username)
+
+    print('Downloading tracks for ' + username)
+    directory = os.path.join('soundcloud-downloads', username)
     if not os.path.exists(directory):
         os.makedirs(directory)
 
-    tracks_url = resolve_profile_tracks_url(username)
     tracks_num = int(get_profile_info(username)['track_count'])
-    track_listing = get_profile_tracks(tracks_url, tracks_num)
-
-    track_amount = [1, len(track_listing)]
-
-    for track in track_listing:
-        print '\nTrack {}/{}'.format(track_amount[0], track_amount[1])
-        username = filter(lambda x: x in string.printable,
-                          track['user']['username'])
-        track_title = filter(lambda x: x in string.printable, track['title'])
-        track_genre = filter(lambda x: x in string.printable, track['genre'])
-
-        download_link = get_download_link(track['waveform_url'])
-        download_file(download_link, username,
-                      track['user']['permalink'], track_title, track_genre)
-
-        print "\n"
-        track_amount[0] += 1
-
-    print "Finished downloading all music\nYou can find the"
-    "music in the soundcloud-downloads/ folder"
+    if tracks_num > 200:
+        track_listing = get_profile_tracks_pbar(tracks_url, tracks_num)
+    else:
+        track_listing = get_profile_tracks(tracks_url)
+    download_tracks(track_listing, directory)
 
     if platform.system() == 'Windows':
-        raw_input('Press enter to continue...')
+        input('Press enter to continue...')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Download a SoundCloud user\'s music. All of it.')
     parser.add_argument(
-        '-u', help='The user\'s SoundCloud permalink (a.k.a The link to'
-        'their profile, without the "http://soundcloud.com" at the start)')
+        '-u', help='The user\'s SoundCloud permalink (a.k.a The link to their profile, without the "http://soundcloud.com" at the start)')
     parsed_args = parser.parse_args()
     main(parsed_args)
